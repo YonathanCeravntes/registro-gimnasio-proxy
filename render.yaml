@@ -2,7 +2,7 @@ services:
   - type: web
     name: registro-gimnasio-proxy
     runtime: node
-    region: virginia
+    region: oregon
     plan: starter
     buildCommand: npm install
     startCommand: node server.js

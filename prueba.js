@@ -18,7 +18,9 @@ const gas = http.createServer((req, res) => {
       if (m === 'cortar-despues') return req.socket.destroy();                                                                 // ejecutó y se cortó
       const k = 'e' + (++n); ecos[k] = JSON.stringify({ ok: true, r: { fn, args: j.args, t: j.t ? 'con token' : 'sin token' } });
       const enviar = () => { res.writeHead(302, { Location: `http://localhost:${PUERTO_GAS}/echo?k=${k}` }); res.end(); };
-      if (m === 'lento') setTimeout(enviar, 1500); else enviar();
+      if (m === 'lento') setTimeout(enviar, 1500);
+      else if (m === 'lento-una-vez' && !ejecuciones['slow:' + fn]) { ejecuciones['slow:' + fn] = 1; setTimeout(enviar, 8000); }
+      else enviar();
     });
     return;
   }
@@ -63,6 +65,12 @@ let logs = ''; proxy.stdout.on('data', d => logs += d); proxy.stderr.on('data', 
   modo.getHistorial = 'cortar-antes';
   r = await post('getHistorial');
   check(r.status === 200 && ejecuciones.getHistorial === 1, 'lectura cortada → se repite y responde');
+  modo.getSemana = 'lento-una-vez';
+  let t0 = Date.now(); r = await post('getSemana'); const dur = Date.now() - t0;
+  check(r.status === 200 && ejecuciones.getSemana === 2 && dur < 7000, 'lectura pegada 8 s → sale otra a los 4,5 s y gana (' + dur + ' ms, 2 ejecuciones)');
+  modo.guardarCardio = 'lento-una-vez';
+  t0 = Date.now(); r = await post('guardarCardio');
+  check(r.status === 200 && ejecuciones.guardarCardio === 1 && Date.now() - t0 >= 7900, 'escritura lenta → espera, sin duplicar (1 ejecución)');
   modo.disenarPlanIA = '503-una-vez';
   r = await post('disenarPlanIA');
   check(r.status === 502 && !ejecuciones.disenarPlanIA, 'IA con 503 → no se repite (cada intento cuesta)');

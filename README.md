@@ -8,13 +8,14 @@ Apps Script (`script.google.com` → `script.googleusercontent.com`), que en red
 
 - Solo reenvía a la URL de Apps Script configurada (no es un proxy abierto) y no guarda datos.
 - Los registros muestran solo la función, el estado y el tiempo; nunca tokens ni contenidos.
-- Lecturas (`get…`) se reintentan; escrituras solo si Google no llegó a ejecutarlas; la IA nunca se repite sola.
+- Lecturas (`get…`): si Apps Script tarda más de 4,5 s, sale otra igual en paralelo y gana la primera (Apps Script a veces
+  se queda pegado 20–30 s). Escrituras: se repiten solo si Google no llegó a ejecutarlas. La IA nunca se repite sola.
 - Si el proxy no responde, la app sigue funcionando directo contra Apps Script.
 
 ## Render
 
 - Tipo: Web Service · Node · `npm install` / `node server.js` · health check `/salud`
-- Variables (opcionales): `APPS_SCRIPT_URL`, `ALLOWED_ORIGINS`, `RATE_LIMIT`
+- Variables (opcionales): `APPS_SCRIPT_URL`, `ALLOWED_ORIGINS`, `RATE_LIMIT`, `COBERTURA_MS`
 
 ## Rutas
 

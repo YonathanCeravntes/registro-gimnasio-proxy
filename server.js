@@ -26,7 +26,7 @@ const POR_MINUTO = Number(process.env.RATE_LIMIT) || 120;
 const LENTAS = new Set(['disenarPlanIA', 'coachAnalizar', 'coachPreguntar', 'probarIAApp']);   // la IA piensa 20–90 s
 const T_NORMAL = 60000, T_LENTA = 170000, T_ECO = 30000;
 const inicio = Date.now();
-const cuenta = { atendidas: 0, fallidas: 0, reintentos: 0 };
+const cuenta = { atendidas: 0, fallidas: 0, reintentos: 0, coberturas: 0 };
 
 const esperar = ms => new Promise(ok => setTimeout(ok, ms));
 const esLectura = fn => /^get/.test(fn);   // getInicio, getPanel…: repetirlas no cambia nada
@@ -75,47 +75,78 @@ function sinConectar(e) {
 function motivo(e) { return String((e && e.cause && (e.cause.code || e.cause.message)) || (e && (e.name === 'TimeoutError' ? 'tiempo agotado' : e.message)) || e); }
 
 /** La respuesta de Apps Script vive en la URL de la redirección (script.googleusercontent.com). Pedirla se puede repetir. */
-async function leerEco(url) {
+async function leerEco(url, senal) {
   let ultimo;
   for (let k = 0; k < 3; k++) {
     if (k) { cuenta.reintentos++; await esperar(400 * k); }
     try {
-      const r = await fetch(url, { redirect: 'follow', signal: AbortSignal.timeout(T_ECO) });
+      const r = await fetch(url, { redirect: 'follow', signal: senal ? AbortSignal.any([senal, AbortSignal.timeout(T_ECO)]) : AbortSignal.timeout(T_ECO) });
       const txt = await r.text();
       if (r.ok) return txt;
       ultimo = new Error('eco HTTP ' + r.status);
-    } catch (e) { ultimo = e; }
+    } catch (e) { ultimo = e; if (senal && senal.aborted) throw e; }
   }
   throw ultimo;
 }
 
+/** Un envío a Apps Script: devuelve { eco } (se ejecutó; la respuesta está en esa URL) o { txt }. */
+async function enviar(cuerpo, limite, senal) {
+  const r = await fetch(DESTINO, { method: 'POST', body: cuerpo, headers: { 'Content-Type': 'text/plain;charset=utf-8' }, redirect: 'manual',
+                                   signal: senal ? AbortSignal.any([senal, AbortSignal.timeout(limite)]) : AbortSignal.timeout(limite) });
+  if (r.status >= 300 && r.status < 400 && r.headers.get('location')) { try { await r.arrayBuffer(); } catch (e) {} return { eco: r.headers.get('location') }; }
+  const txt = await r.text().catch(() => '');
+  if (r.ok) return { txt };                                    // (Apps Script a veces responde directo)
+  throw Object.assign(new Error('Apps Script HTTP ' + r.status), { status: r.status });
+}
+
 /**
- * Envía la llamada a Apps Script. Lecturas: hasta 3 intentos. Escrituras: se repiten solo si la conexión no llegó a
- * abrirse o si Google respondió 429/503 (no ejecutó). Llamadas de IA: nunca se repiten (cada intento cuesta).
+ * Lecturas con "cobertura": si la primera tarda más de COBERTURA_MS (Apps Script a veces se queda pegado 20–30 s),
+ * sale otra igual en paralelo y gana la primera que responda. Repetir una lectura no cambia nada.
+ */
+const COBERTURA_MS = Number(process.env.COBERTURA_MS) || 4500;
+function conCobertura(fabricar, espera) {
+  return new Promise((ok, ko) => {
+    const ctrls = []; let listo = false, vivas = 0, ultimo = null, timer = null;
+    const lanzar = () => {
+      const c = new AbortController(); ctrls.push(c); vivas++;
+      fabricar(c.signal).then(v => {
+        if (listo) return; listo = true; clearTimeout(timer);
+        ctrls.forEach(x => { if (x !== c) x.abort(); });
+        ok(v);
+      }, e => {
+        vivas--; ultimo = e; if (listo) return;
+        if (ctrls.length < 2) { clearTimeout(timer); cuenta.reintentos++; lanzar(); }   // falló rápido: la segunda sale ya
+        else if (vivas === 0) { listo = true; ko(ultimo); }
+      });
+    };
+    lanzar();
+    timer = setTimeout(() => { if (!listo && ctrls.length < 2) { cuenta.coberturas++; lanzar(); } }, espera);
+  });
+}
+async function leer(cuerpo) {
+  const una = async senal => { const x = await enviar(cuerpo, T_NORMAL, senal); return x.eco ? await leerEco(x.eco, senal) : x.txt; };
+  try { return await conCobertura(una, COBERTURA_MS); }
+  catch (e) { cuenta.reintentos++; await esperar(600); return await conCobertura(una, COBERTURA_MS); }
+}
+
+/**
+ * Envía la llamada a Apps Script. Lecturas (get…): con cobertura y un reintento. Escrituras: se repiten solo si la
+ * conexión no llegó a abrirse o si Google respondió 429/503 (no ejecutó). IA: nunca se repite (cada intento cuesta).
  */
 async function llamarAppsScript(cuerpo, fn) {
-  const lectura = esLectura(fn), lenta = LENTAS.has(fn);
-  const intentos = lectura ? 3 : lenta ? 1 : 2;
+  if (esLectura(fn)) return leer(cuerpo);
+  const lenta = LENTAS.has(fn), intentos = lenta ? 1 : 2;
   let ultimo = null;
   for (let i = 0; i < intentos; i++) {
     if (i) { cuenta.reintentos++; await esperar(500 * i); }
-    let r;
-    try {
-      r = await fetch(DESTINO, { method: 'POST', body: cuerpo, headers: { 'Content-Type': 'text/plain;charset=utf-8' }, redirect: 'manual',
-                                 signal: AbortSignal.timeout(lenta ? T_LENTA : T_NORMAL) });
-    } catch (e) {
+    let x;
+    try { x = await enviar(cuerpo, lenta ? T_LENTA : T_NORMAL); }
+    catch (e) {
       ultimo = e;
-      if (lectura || sinConectar(e)) continue;
+      if (sinConectar(e) || e.status === 429 || e.status === 503) continue;   // no se ejecutó: se puede repetir
       break;
     }
-    if (r.status >= 300 && r.status < 400 && r.headers.get('location')) {
-      try { await r.arrayBuffer(); } catch (e) {}
-      return await leerEco(r.headers.get('location'));   // ya se ejecutó: solo falta leer la respuesta
-    }
-    const txt = await r.text().catch(() => '');
-    if (r.ok) return txt;                                     // (Apps Script a veces responde directo)
-    ultimo = new Error('Apps Script HTTP ' + r.status);
-    if (!lectura && r.status !== 429 && r.status !== 503) break;
+    return x.eco ? await leerEco(x.eco) : x.txt;              // ya se ejecutó: solo falta leer la respuesta
   }
   throw ultimo || new Error('sin respuesta');
 }
