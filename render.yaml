@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: registro-gimnasio-proxy
+    runtime: node
+    region: virginia
+    plan: starter
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /salud
+    autoDeploy: true
+    envVars:
+      - key: ALLOWED_ORIGINS
+        value: https://yonathanceravntes.github.io
