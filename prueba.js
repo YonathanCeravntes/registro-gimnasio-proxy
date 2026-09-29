@@ -8,6 +8,9 @@ const PUERTO_GAS = 18081, PUERTO_PROXY = 18082, ORIGEN = 'http://localhost:8130'
 let modo = {}, ejecuciones = {}, ecos = {}, n = 0;
 const gas = http.createServer((req, res) => {
   const u = new URL(req.url, 'http://x');
+  if (u.pathname === '/exec' && req.method === 'GET' && u.searchParams.get('api') === 'pushnonce') {
+    res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: u.searchParams.get('n') === 'nonce-valido-1234567890' }));
+  }
   if (u.pathname === '/exec' && req.method === 'GET') { res.writeHead(302, { Location: `http://localhost:${PUERTO_GAS}/echo?k=ping` }); ecos.ping = '{"ok":true,"hora":"ahora"}'; return res.end(); }
   if (u.pathname === '/exec') {
     let b = ''; req.on('data', d => b += d); req.on('end', () => {
@@ -42,7 +45,20 @@ const pedir = (metodo, ruta, cuerpo, origen) => new Promise(ok => {
 });
 const post = (fn, extra) => pedir('POST', '/api', JSON.stringify(Object.assign({ fn, args: [1], t: 'TOKEN-SECRETO' }, extra || {})), ORIGEN);
 
-const proxy = spawn(process.execPath, [__dirname + '/server.js'], { env: Object.assign({}, process.env, { PORT: PUERTO_PROXY, APPS_SCRIPT_URL: `http://localhost:${PUERTO_GAS}/exec`, ALLOWED_ORIGINS: ORIGEN, RATE_LIMIT: 60 }) });
+// Servicio de avisos simulado (como el de Apple o Google): responde 201, o 410 si la suscripción ya no existe
+// (HTTPS con un certificado de prueba hecho aquí mismo, como los servicios reales; el proxy de prueba lo acepta)
+const PUERTO_PUSH = 18083, avisos = [];
+const os = require('os'), fs = require('fs'), path = require('path'), { execSync } = require('child_process');
+const dirCert = fs.mkdtempSync(path.join(os.tmpdir(), 'cert-'));
+let hayCert = true;
+try { execSync(`openssl req -x509 -newkey rsa:2048 -nodes -keyout "${dirCert}/k.pem" -out "${dirCert}/c.pem" -days 1 -subj /CN=localhost`, { stdio: 'ignore' }); } catch (e) { hayCert = false; }
+const servPush = (hayCert ? require('https').createServer({ key: fs.readFileSync(dirCert + '/k.pem'), cert: fs.readFileSync(dirCert + '/c.pem') }) : http.createServer()).on('request', (req, res) => { let n = 0; req.on('data', d => n += d.length); req.on('end', () => {
+  avisos.push({ ruta: req.url, auth: String(req.headers.authorization || ''), enc: req.headers['content-encoding'], bytes: n });
+  res.writeHead(/vencida/.test(req.url) ? 410 : 201); res.end(); }); }).listen(PUERTO_PUSH);
+const crypto = require('crypto');
+const nuevaSub = ruta => { const e = crypto.createECDH('prime256v1'); e.generateKeys();
+  return { endpoint: `https://localhost:${PUERTO_PUSH}/push/${ruta}`, keys: { p256dh: e.getPublicKey().toString('base64url'), auth: crypto.randomBytes(16).toString('base64url') } }; };
+const proxy = spawn(process.execPath, [__dirname + '/server.js'], { env: Object.assign({}, process.env, { NODE_TLS_REJECT_UNAUTHORIZED: '0', PORT: PUERTO_PROXY, APPS_SCRIPT_URL: `http://localhost:${PUERTO_GAS}/exec`, ALLOWED_ORIGINS: ORIGEN, RATE_LIMIT: 60 }) });
 let logs = ''; proxy.stdout.on('data', d => logs += d); proxy.stderr.on('data', d => logs += d);
 
 (async () => {
@@ -96,10 +112,36 @@ let logs = ''; proxy.stdout.on('data', d => logs += d); proxy.stderr.on('data', 
   check(r.status === 204 && r.headers['access-control-allow-methods'], 'OPTIONS (preflight) → 204');
   r = await pedir('GET', '/otra');
   check(r.status === 404, 'rutas desconocidas → 404 (no es proxy abierto)');
+  // Avisos en el celular: solo Apps Script (número de un solo uso) puede pedir claves y mandar avisos
+  r = await pedir('POST', '/push/iniciar', JSON.stringify({ nonce: 'nonce-falso-00000000000' }));
+  check(r.status === 403, 'push/iniciar sin un número válido de Apps Script → 403');
+  r = await pedir('POST', '/push/iniciar', JSON.stringify({ nonce: 'nonce-valido-1234567890' }));
+  const claves = JSON.parse(r.body);
+  check(r.status === 200 && claves.publicKey.length === 87 && claves.privateKey.length === 43, 'push/iniciar con número válido → par de claves VAPID nuevo');
+  if (!hayCert) console.log('  (sin openssl: se omite el envío de avisos)');
+  if (hayCert) {
+  r = await pedir('POST', '/push/enviar', JSON.stringify({ nonce: 'nonce-valido-1234567890', vapid: { publicKey: claves.publicKey, privateKey: claves.privateKey, subject: 'mailto:prueba@example.com' },
+    envios: [{ sub: nuevaSub('ok1'), datos: { titulo: 'Hoy: Torso', texto: 'Toca pesas' } }, { sub: nuevaSub('vencida'), datos: { titulo: 'x' } }, { sub: { endpoint: 'mala' }, datos: {} }] }));
+  let j = JSON.parse(r.body);
+  check(r.status === 200 && j.enviados === 1 && j.vencidas.length === 1 && /vencida/.test(j.vencidas[0]), 'envía el aviso, avisa cuál suscripción ya no existe e ignora la inválida');
+  check(avisos.length === 2 && /^vapid t=/.test(avisos[0].auth) && avisos[0].enc === 'aes128gcm' && avisos[0].bytes > 0, 'el aviso va firmado (VAPID) y cifrado (aes128gcm)');
+  r = await pedir('POST', '/push/enviar', JSON.stringify({ nonce: 'nonce-valido-1234567890', vapid: claves, envios: [
+    { sub: nuevaSub('descanso'), retrasoSeg: 1, datos: { titulo: 'Descanso terminado', tag: 'descanso' } }] }));
+  j = JSON.parse(r.body);
+  check(j.programados === 1 && avisos.length === 2, 'fin del descanso: queda programado, no sale todavía');
+  await new Promise(ok2 => setTimeout(ok2, 1600));
+  check(avisos.length === 3 && /descanso/.test(avisos[2].ruta), '…y sale al cumplirse el tiempo');
+  const subC = nuevaSub('cancelado');
+  await pedir('POST', '/push/enviar', JSON.stringify({ nonce: 'nonce-valido-1234567890', vapid: claves, envios: [{ sub: subC, retrasoSeg: 1, datos: { titulo: 'x', tag: 'descanso' } }] }));
+  r = await pedir('POST', '/push/enviar', JSON.stringify({ nonce: 'nonce-valido-1234567890', vapid: claves, envios: [{ sub: subC, cancelar: true, datos: { tag: 'descanso' } }] }));
+  await new Promise(ok2 => setTimeout(ok2, 1500));
+  check(JSON.parse(r.body).cancelados === 1 && avisos.length === 3, 'si paras el descanso, el aviso programado se cancela');
+  }
   let limite = 0; for (let i = 0; i < 70; i++) { const x = await pedir('GET', '/api?api=ping'); if (x.status === 429) limite++; }
   check(limite > 0, 'límite por minuto → 429 (' + limite + ' rechazadas de 70)');
   check(!/TOKEN-SECRETO/.test(logs) && /getInicio 200/.test(logs), 'los registros no muestran el token (solo función, estado y tiempo)');
+  check(!/localhost:18083|p256dh|privateKey/.test(logs), 'los registros no muestran suscripciones ni claves de los avisos');
   console.log('--- registro del proxy ---\n' + logs.trim().split('\n').slice(0, 12).join('\n'));
-  proxy.kill(); gas.close();
+  proxy.kill(); gas.close(); servPush.close();
   console.log(ok ? 'TODO OK' : 'HAY FALLOS'); process.exit(ok ? 0 : 1);
 })();

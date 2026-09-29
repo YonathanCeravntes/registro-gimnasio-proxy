@@ -17,6 +17,8 @@
  */
 'use strict';
 const http = require('http');
+let webpush = null;
+try { webpush = require('web-push'); } catch (e) { /* sin la dependencia, los avisos quedan apagados y el resto sigue igual */ }
 
 const DESTINO = process.env.APPS_SCRIPT_URL || 'https://script.google.com/macros/s/AKfycbxpNYt8b4tM8Bzk0I1tC2EoZplQqsqtm0iK2kgqpOO4-hcrTp_tzuGN0nhSKD42o8tD/exec';
 const ORIGENES = (process.env.ALLOWED_ORIGINS || 'https://yonathanceravntes.github.io').split(',').map(s => s.trim()).filter(Boolean);
@@ -153,6 +155,60 @@ async function llamarAppsScript(cuerpo, fn, lentaPedida) {
   throw ultimo || new Error('sin respuesta');
 }
 
+/* ---------- Avisos en el celular (Web Push) ----------
+ * Apps Script guarda las claves VAPID y las suscripciones; aquí solo se firman y se mandan los avisos (Apps Script no tiene
+ * criptografía de curva elíptica). Solo Apps Script puede pedirlo: deja un número de un solo uso en su caché y el proxy lo
+ * confirma con ?api=pushnonce. Un aviso con retraso (fin del descanso) queda en memoria hasta 15 min; uno nuevo con la misma
+ * etiqueta para el mismo celular reemplaza al anterior. No se registran direcciones de suscripción ni claves.
+ */
+const MAX_RETRASO = 15 * 60;
+const programados = new Map();
+async function nonceValido(n) {
+  if (!/^[A-Za-z0-9_-]{16,80}$/.test(String(n || ''))) return false;
+  try {
+    const r = await fetch(DESTINO + '?api=pushnonce&n=' + encodeURIComponent(n), { redirect: 'follow', signal: AbortSignal.timeout(T_NORMAL) });
+    const j = await r.json().catch(() => null);
+    return !!(j && j.ok === true);
+  } catch (e) { return false; }
+}
+function subValida(s) {
+  return !!(s && typeof s.endpoint === 'string' && /^https:\/\//i.test(s.endpoint) &&
+            s.keys && typeof s.keys.p256dh === 'string' && typeof s.keys.auth === 'string');
+}
+async function pushIniciar(j) {
+  if (!webpush) return [503, { ok: false, error: 'Avisos no disponibles' }];
+  if (!await nonceValido(j.nonce)) return [403, { ok: false, error: 'No autorizado' }];
+  const k = webpush.generateVAPIDKeys();
+  return [200, { ok: true, publicKey: k.publicKey, privateKey: k.privateKey }];
+}
+async function pushEnviar(j) {
+  if (!webpush) return [503, { ok: false, error: 'Avisos no disponibles' }];
+  if (!await nonceValido(j.nonce)) return [403, { ok: false, error: 'No autorizado' }];
+  const v = j.vapid || {};
+  if (!v.publicKey || !v.privateKey) return [400, { ok: false, error: 'Faltan las claves' }];
+  const opciones = { vapidDetails: { subject: v.subject || 'mailto:avisos@example.com', publicKey: v.publicKey, privateKey: v.privateKey }, TTL: 3600, timeout: 20000 };
+  const mandar = async e => {
+    try { await webpush.sendNotification(e.sub, JSON.stringify(e.datos || {}), opciones); return 'ok'; }
+    catch (err) { const st = err && err.statusCode; return st === 404 || st === 410 ? 'vencida' : 'error ' + (st || motivo(err)); }
+  };
+  const res = { ok: true, enviados: 0, programados: 0, vencidas: [] };
+  for (const e of (Array.isArray(j.envios) ? j.envios : []).slice(0, 50)) {
+    if (!subValida(e && e.sub)) continue;
+    const retraso = Math.max(0, Math.min(MAX_RETRASO, Number(e.retrasoSeg) || 0));
+    const clave = String(e.datos && e.datos.tag || '') + '|' + e.sub.endpoint;
+    if (e.cancelar) { clearTimeout(programados.get(clave)); programados.delete(clave); res.cancelados = (res.cancelados || 0) + 1; continue; }
+    if (retraso) {
+      clearTimeout(programados.get(clave));
+      programados.set(clave, setTimeout(() => { programados.delete(clave); mandar(e).then(r => console.log('push programado ' + r.split(' ')[0])); }, retraso * 1000));
+      res.programados++;
+    } else {
+      const r = await mandar(e);
+      if (r === 'ok') res.enviados++; else if (r === 'vencida') res.vencidas.push(e.sub.endpoint); else console.log('push ' + r);
+    }
+  }
+  return [200, res];
+}
+
 /* ---------- Servidor ---------- */
 const servidor = http.createServer(async (req, res) => {
   cors(req, res);
@@ -160,6 +216,16 @@ const servidor = http.createServer(async (req, res) => {
   if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
   if (req.method === 'GET' && (url.pathname === '/salud' || url.pathname === '/')) {
     return responder(res, 200, { ok: true, servicio: 'proxy Mi plan', desde: new Date(inicio).toISOString(), ...cuenta });
+  }
+  if (url.pathname === '/push/iniciar' || url.pathname === '/push/enviar') {
+    if (req.method !== 'POST') return responder(res, 405, { ok: false, error: 'Método no permitido' });
+    if (limitar(req)) return responder(res, 429, { ok: false, error: 'Demasiadas peticiones; espera un minuto.' });
+    let j;
+    try { j = JSON.parse(await leerCuerpo(req)); } catch (e) { return responder(res, 400, { ok: false, error: 'Petición no válida.' }); }
+    const t0 = Date.now();
+    const [st, cuerpo] = await (url.pathname === '/push/iniciar' ? pushIniciar(j || {}) : pushEnviar(j || {}));
+    console.log(`${url.pathname} ${st} ${Date.now() - t0}ms`);
+    return responder(res, st, cuerpo);
   }
   if (url.pathname !== '/api') return responder(res, 404, { ok: false, error: 'No encontrado' });
   if (limitar(req)) return responder(res, 429, { ok: false, error: 'Demasiadas peticiones; espera un minuto.' });
