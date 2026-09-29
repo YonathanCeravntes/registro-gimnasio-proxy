@@ -74,6 +74,13 @@ let logs = ''; proxy.stdout.on('data', d => logs += d); proxy.stderr.on('data', 
   modo.disenarPlanIA = '503-una-vez';
   r = await post('disenarPlanIA');
   check(r.status === 502 && !ejecuciones.disenarPlanIA, 'IA con 503 → no se repite (cada intento cuesta)');
+  // Una función de IA que el proxy no conoce por nombre, pero la app la marca "lenta": tampoco se repite
+  modo.planDesdeOpcionCoach = '503-una-vez';
+  r = await pedir('POST', '/api', JSON.stringify({ fn: 'planDesdeOpcionCoach', args: [], lenta: 1 }), ORIGEN);
+  check(r.status === 502 && !ejecuciones.planDesdeOpcionCoach, 'IA nueva marcada "lenta" con 503 → no se repite');
+  modo.getAlgoConIA = 'lento-una-vez'; t0 = Date.now();
+  r = await pedir('POST', '/api', JSON.stringify({ fn: 'getAlgoConIA', args: [], lenta: 1 }), ORIGEN);
+  check(r.status === 200 && ejecuciones.getAlgoConIA === 1, 'lectura marcada "lenta" (8 s) → sin cobertura, 1 sola ejecución');
   modo.coachPreguntar = 'lento';
   r = await post('coachPreguntar');
   check(r.status === 200 && ejecuciones.coachPreguntar === 1, 'llamada lenta (1,5 s) → espera y responde');

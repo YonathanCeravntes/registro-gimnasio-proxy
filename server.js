@@ -23,7 +23,9 @@ const ORIGENES = (process.env.ALLOWED_ORIGINS || 'https://yonathanceravntes.gith
 const PUERTO = Number(process.env.PORT) || 10000;
 const MAX_CUERPO = 30 * 1024 * 1024;                  // fotos en base64
 const POR_MINUTO = Number(process.env.RATE_LIMIT) || 120;
-const LENTAS = new Set(['disenarPlanIA', 'coachAnalizar', 'coachPreguntar', 'probarIAApp']);   // la IA piensa 20–90 s
+// La IA piensa 20–90 s: más tiempo y sin repetir. La app también marca sus llamadas lentas con "lenta": 1 (así una función nueva
+// de IA no depende de actualizar esta lista).
+const LENTAS = new Set(['disenarPlanIA', 'coachAnalizar', 'coachPreguntar', 'probarIAApp', 'planDesdeOpcionCoach']);
 const T_NORMAL = 60000, T_LENTA = 170000, T_ECO = 30000;
 const inicio = Date.now();
 const cuenta = { atendidas: 0, fallidas: 0, reintentos: 0, coberturas: 0 };
@@ -133,9 +135,9 @@ async function leer(cuerpo) {
  * Envía la llamada a Apps Script. Lecturas (get…): con cobertura y un reintento. Escrituras: se repiten solo si la
  * conexión no llegó a abrirse o si Google respondió 429/503 (no ejecutó). IA: nunca se repite (cada intento cuesta).
  */
-async function llamarAppsScript(cuerpo, fn) {
-  if (esLectura(fn)) return leer(cuerpo);
-  const lenta = LENTAS.has(fn), intentos = lenta ? 1 : 2;
+async function llamarAppsScript(cuerpo, fn, lentaPedida) {
+  const lenta = !!lentaPedida || LENTAS.has(fn), intentos = lenta ? 1 : 2;
+  if (esLectura(fn) && !lenta) return leer(cuerpo);
   let ultimo = null;
   for (let i = 0; i < intentos; i++) {
     if (i) { cuenta.reintentos++; await esperar(500 * i); }
@@ -174,18 +176,19 @@ const servidor = http.createServer(async (req, res) => {
   }
   if (req.method !== 'POST') return responder(res, 405, { ok: false, error: 'Método no permitido' });
 
-  let cuerpo, fn = '?';
+  let cuerpo, fn = '?', lenta = false;
   try {
     cuerpo = await leerCuerpo(req);
     const j = JSON.parse(cuerpo);
     fn = String(j && j.fn || '');
+    lenta = !!(j && j.lenta);
     if (!/^[A-Za-z_]\w{0,60}$/.test(fn)) throw Object.assign(new Error('Falta la función'), { status: 400 });
   } catch (e) {
     return responder(res, e.status || 400, { ok: false, error: e.status === 413 ? 'La petición es demasiado grande.' : 'Petición no válida.' });
   }
   const t0 = Date.now();
   try {
-    const txt = await llamarAppsScript(cuerpo, fn);
+    const txt = await llamarAppsScript(cuerpo, fn, lenta);
     cuenta.atendidas++;
     console.log(`${fn} 200 ${Date.now() - t0}ms`);
     return responder(res, 200, txt);
